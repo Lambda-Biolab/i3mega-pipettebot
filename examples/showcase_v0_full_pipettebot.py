@@ -68,8 +68,8 @@ Optional:
     PIPETTE_VOLUME_UL    Per-channel volume in microlitres. Default 100.0.
                          Ignored when PIPETTE_PROFILE is set.
     PIPETTE_PROFILE      Path to a TOML experiment profile that specifies
-                         per-column volumes. See `examples/profiles/*.toml`
-                         and `src/pipettebot/profiles.py` for the schema.
+                         per-column volumes. See `examples/experiment_profiles/*.toml`
+                         and `src/pipettebot/experiment_profile.py` for the schema.
                          Profile length sets the column count (overrides
                          NUM_COLUMNS).
     OUTPUT_GCODE         Path to tee Marlin commands to disk. Default
@@ -87,9 +87,12 @@ dispense Z need not be above any liquid line (first-and-only fill per
 well). The B3 BLOW piston return creates suction; submerged dispense
 would draw extra liquid, but with empty target wells this is moot.
 
-**Side effect**: raises Marlin's Z max feedrate (M203 Z20) and Z accel
-(M201 Z200), disables soft endstops (M211 S0). All last until power
-cycle unless saved with M500.
+**Side effect**: installs the liquid-handling motion profile via
+`pipettebot.motion_profile.select_profile(MOTION_PROFILE)`. Defaults
+to MID when env unset; set `MOTION_PROFILE=slow|fast` to dial, or
+`MOTION_PROFILE=off` to skip. Also disables soft endstops (`M211 S0`).
+All installed settings last until power cycle unless saved with `M500`.
+See `src/pipettebot/motion_profile.py` for the bundled profile values.
 """
 
 from __future__ import annotations
@@ -101,8 +104,9 @@ from typing import TYPE_CHECKING
 
 from dpette import DPetteDriver, SerialConfig
 
+from pipettebot.cli_profile import build_volumes
 from pipettebot.gantry import open_marlin_port
-from pipettebot.profiles import load_profile
+from pipettebot.motion_profile import select_profile
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -110,12 +114,9 @@ if TYPE_CHECKING:
 
     import serial  # type: ignore[import-untyped]
 
-    from pipettebot.profiles import ExperimentProfile
-
 DEFAULT_BAUD = 250000
 DEFAULT_PIPETTE_BAUD = 9600
 DEFAULT_GCODE_OUT = "showcase_v0_full_pipettebot.gcode"
-DEFAULT_VOLUME_UL = 100.0
 
 # --- Deck geometry ------------------------------------------------------
 # Canonical source: docs/deck-layout.md "Slot extents" + "Motion constants".
@@ -391,11 +392,23 @@ def _run(
     _phase_comment(
         gcode_out,
         _gcode_header(volumes_ul)
-        + "; raise Z max feedrate + accel for snappy moves\n"
         + "; disable software endstops defensively (Y axis positive 0-250)\n",
     )
-    gsend(link, "M203 Z20", gcode_out=gcode_out)
-    gsend(link, "M201 Z200", gcode_out=gcode_out)
+    profile = select_profile(os.environ.get("MOTION_PROFILE"))
+    if profile is None:
+        print("[host] motion profile: SKIPPED (MOTION_PROFILE opt-out)")
+        _phase_comment(
+            gcode_out, "; motion profile: SKIPPED (MOTION_PROFILE opt-out)\n"
+        )
+    else:
+        print(f"[host] motion profile: {profile.name}")
+        _phase_comment(
+            gcode_out,
+            f"; motion profile: {profile.name} "
+            "(via pipettebot.motion_profile.select_profile)\n",
+        )
+        for cmd in profile.as_marlin():
+            gsend(link, cmd, gcode_out=gcode_out)
     gsend(link, "M211 S0", gcode_out=gcode_out)
 
     _phase_comment(
@@ -464,29 +477,6 @@ def _run(
     gsend(link, "M400", gcode_out=gcode_out)
 
 
-def _resolve_profile() -> ExperimentProfile | None:
-    path = os.environ.get("PIPETTE_PROFILE", "").strip()
-    if not path:
-        return None
-    return load_profile(path)
-
-
-def _build_volumes() -> tuple[tuple[float, ...], str]:
-    """Return (volumes_ul, banner). Banner describes the schedule for stdout."""
-    profile = _resolve_profile()
-    if profile is not None:
-        banner = f"profile {profile.name!r}: {profile.num_cycles} columns"
-        if profile.description:
-            banner += f"\n  {profile.description}"
-        if profile.gradient_description:
-            banner += f"\n  gradient: {profile.gradient_description}"
-        return profile.volumes_ul, banner
-    volume_ul = float(os.environ.get("PIPETTE_VOLUME_UL", str(DEFAULT_VOLUME_UL)))
-    return (volume_ul,) * NUM_COLUMNS, (
-        f"constant volume {volume_ul:.1f} uL x {NUM_COLUMNS} columns"
-    )
-
-
 def main() -> int:
     port = os.environ.get("I3MEGA_PORT")
     pipette_port = os.environ.get("PIPETTE_PORT")
@@ -498,7 +488,7 @@ def main() -> int:
         return 1
     baud = int(os.environ.get("I3MEGA_BAUD", str(DEFAULT_BAUD)))
     pipette_baud = int(os.environ.get("PIPETTE_BAUD", str(DEFAULT_PIPETTE_BAUD)))
-    volumes_ul, banner = _build_volumes()
+    volumes_ul, banner = build_volumes(NUM_COLUMNS, "columns")
     gcode_path = os.environ.get("OUTPUT_GCODE", DEFAULT_GCODE_OUT)
 
     link = open_marlin_port(port, baudrate=baud, timeout=2.0)

@@ -51,11 +51,11 @@ Per-cycle gantry shape (mirrors the hand-traced G-code calibration):
 
     --- EJECT @ release bar ---
     G1 X10 Y220                  ; cross-deck transit to release area
-    G1 X0                        ; slide onto bar engagement column
+    G1 X5                        ; slide onto bar engagement column
     G1 Z98                       ; descend — hook engages bar from above
     G1 Z115                      ; lift — bar holds handle, body rises → tip ejected
 
-Between cycles the head sits at (X=0, Y=220, Z=115); cycle N+1's
+Between cycles the head sits at (X=5, Y=220, Z=115); cycle N+1's
 first move (`G1 Z90 X171 Y...`) is a single diagonal back to the next
 tip-box row.
 
@@ -79,15 +79,32 @@ Environment variables (all optional — modes chosen from env presence):
     PIPETTE_PORT         dPette USB-serial path. If unset, aspirate /
                          dispense ops are skipped and logged as
                          `; skipped` in the tee.
-    NUM_CYCLES           Number of rows to fill. Default 12, range 1..12.
-                         12 is the natural 96-well max (8 channels × 12
-                         rows = 96 wells). See bed-range warning below.
+    NUM_CYCLES           Number of rows to fill. Default 8, range 1..8.
+                         Cap lowered 12 → 8 for safety until the
+                         bed/plate part layout is re-arranged
+                         (tip-box and well-plate footprints clash with
+                         fixtures past N=8). See `# FIXME` on
+                         `MAX_NUM_CYCLES` and the bed-range warning below.
     I3MEGA_BAUD          Default 250000 (Anycubic stock + MARLIN-AI3M).
     PIPETTE_BAUD         Default 9600 (DLAB dPette CP2102 stock).
     PIPETTE_VOLUME_UL    Per-channel volume in microlitres. Default 100.0.
+                         Ignored when PIPETTE_PROFILE is set.
+    PIPETTE_PROFILE      Path to a TOML experiment profile that specifies
+                         per-cycle volumes. See `examples/experiment_profiles/*.toml`
+                         and `src/pipettebot/experiment_profile.py` for the schema.
+                         Profile length overrides NUM_CYCLES; per-cycle
+                         B2 PI_VOLUM is re-sent only on volume change.
     OUTPUT_GCODE         Path to tee Marlin commands to disk. Default
                          `showcase_v0_full_pipettebot_rows.gcode` in cwd.
                          Set to empty (`OUTPUT_GCODE=`) to disable.
+    SO101_CONFIG         Path to a so101 arms.yaml (e.g.
+                         `configs/so101_arms.yaml`). When set, the
+                         orchestrator runs the demo_pickup_* sequence on
+                         the SO-101 follower AFTER the final `G28 + M400`.
+                         Preflight validates the named positions exist
+                         BEFORE any i3 motion. Needs the `[orchestrator]`
+                         extra: `uv sync --extra orchestrator`.
+    SO101_ARM_ID         Arm id for the bin pickup (default: arm_a).
 
 Run modes (auto-selected from env presence):
 
@@ -99,20 +116,24 @@ Run modes (auto-selected from env presence):
     DRY RUN       neither set — no serial; G-code tee only (useful for
                   inspecting the generated tour before plugging in).
 
-**Bed-range warning**: tip-box row Y = 156 + 9·(N−1). At N=12 that's
-Y=255 — outside the i3 Mega Y=0–250 envelope. Cycles 11 and 12 will
-drive the head past the front frame. `M211 S0` (bootstrap) disables
-soft endstops so Marlin will obey; verify your tip-box position
-allows N>10 before running.
+**Bed-range warning**: tip-box row Y = 156 + 9·(N−1). At N=8 that's
+Y=219 — within the Y=0–250 envelope but close to the front of bed
+travel. The hard cap is `MAX_NUM_CYCLES=8` for safety until the bed
+part layout is re-arranged (see the `# FIXME` on the constant).
+`M211 S0` (bootstrap) disables soft endstops so Marlin will obey;
+verify your tip-box position before running.
 
 **Safety**: dPette dispense at WELL_DISPENSE_Z = aspirate Z = 70 mm.
 Each SBS well starts empty, so the B3 BLOW piston-return suction
 draws no extra liquid (per `.claude/rules/motion-safety.md` tip-above-
 liquid rule — boundary case).
 
-**Side effect**: raises Marlin's Z max feedrate (M203 Z20), Z accel
-(M201 Z200), and disables soft endstops (M211 S0). All last until
-power cycle unless saved with M500.
+**Side effect**: installs the liquid-handling motion profile via
+`pipettebot.motion_profile.select_profile(MOTION_PROFILE)`. Defaults
+to MID when env unset; set `MOTION_PROFILE=slow|fast` to dial, or
+`MOTION_PROFILE=off` to skip. Also disables soft endstops (`M211 S0`).
+All installed settings last until power cycle unless saved with `M500`.
+See `src/pipettebot/motion_profile.py` for the bundled profile values.
 """
 
 from __future__ import annotations
@@ -124,7 +145,9 @@ from typing import TYPE_CHECKING
 
 from dpette import DPetteDriver, SerialConfig
 
+from pipettebot.cli_profile import build_volumes
 from pipettebot.gantry import open_marlin_port
+from pipettebot.motion_profile import select_profile
 
 if TYPE_CHECKING:
     from typing import TextIO
@@ -134,11 +157,15 @@ if TYPE_CHECKING:
 DEFAULT_BAUD = 250000
 DEFAULT_PIPETTE_BAUD = 9600
 DEFAULT_GCODE_OUT = "showcase_v0_full_pipettebot_rows.gcode"
-DEFAULT_VOLUME_UL = 100.0
 
 # --- Cycle envelope -----------------------------------------------------
-DEFAULT_NUM_CYCLES = 12
-MAX_NUM_CYCLES = 12  # 96-well plate = 8 channels × 12 rows
+# FIXME: cap lowered 12 → 8 for safety. The current part layout on the
+# bed/plate is not yet safety-compliant for the full 12-row tour — at
+# N>8 the tip-box and well-plate footprints clash with fixtures on the
+# bed. Restore to 12 (96-well plate = 8 channels × 12 rows) once the
+# bed layout is re-arranged and re-measured.
+DEFAULT_NUM_CYCLES = 8
+MAX_NUM_CYCLES = 8
 MIN_NUM_CYCLES = 1
 
 # --- Deck geometry (Marlin frame) ---------------------------------------
@@ -165,10 +192,15 @@ RESERVOIR_Y = 100.0  # aspirate position
 WELL_X = 51.0
 WELL_Y_ROW1 = 79.0  # cycle 1; cycle N at WELL_Y_ROW1 + (N-1)*SBS_ROW_PITCH
 
-# Release bar: approach diagonally to (X=10, Y=220) above the slide,
-# slide laterally to X=0, then engage from above.
+# Release bar: a horizontal rod attached to the i3 Mega's FIXED FRAME
+# (not the moving bed) at the front of the chassis, oriented along the
+# Y axis at carriage X≈5, engagement Z=RELEASE_ENGAGE_Z. To align the
+# dPette under the fixed hook, the bed slides forward so the commanded
+# Marlin Y reads Y=220 at engagement. X=5 not X=0 — X=0 is too close to
+# the X-min endstop, was a stale value. Y=220 re-measured per user
+# fixture after an earlier value of Y=190 was found to miss the hook.
 RELEASE_APPROACH_X = 10.0
-RELEASE_BAR_X = 0.0
+RELEASE_BAR_X = 5.0
 RELEASE_BAR_Y = 220.0  # shared Y for both approach and engagement
 
 # --- Motion altitudes ---------------------------------------------------
@@ -191,6 +223,22 @@ PARK_FINAL_Y = 10.0  # final park Y — towards home corner
 # --- Feedrates (under M203 X500 Y500 / Z20 caps after bootstrap bump) ---
 XY_FEED = 12000  # 200 mm/s — well under the X/Y caps
 Z_FEED = 1200  # 20 mm/s — at the M203 Z20 cap
+
+# Per-dive Z feedrates — slower than Z_FEED for damage / liquid protection.
+# Applied only on the DESCENT into critical contact points; lifts always
+# use the full Z_FEED (no damage risk on the way up, save cycle time).
+TIP_BOX_ENGAGE_FEED = 300  # 5 mm/s — mechanical engagement on tip tops; slow to avoid bending tips or shearing posts
+BAR_ENGAGE_FEED = (
+    300  # 5 mm/s — mechanical hook engagement on release bar; slow to avoid impact
+)
+LIQUID_DIVE_FEED = 600  # 10 mm/s — meniscus contact (reservoir + wells); slightly slowed for clean entry
+
+# Touchdown split — descend at full Z_FEED until this distance above the
+# target Z, then drop to the slow contact feedrate for the last leg.
+# Protects the contact point (tips/posts, bar, meniscus) without paying
+# the slow feedrate for the whole dive. All four dive distances exceed
+# this approach distance, so the split is always valid.
+TOUCHDOWN_APPROACH_MM = 10.0
 
 
 def gsend(
@@ -266,7 +314,15 @@ def _pickup(
         gcode_out=gcode_out,
     )
     gsend(link, "M400", gcode_out=gcode_out)
-    gsend(link, f"G1 Z{TIP_PICKUP_Z:.3f} F{Z_FEED}", gcode_out=gcode_out)
+    # Engage descent — touchdown split: fast until 10mm above the tip tops,
+    # then slow (damage protection — bend tips / shear posts).
+    gsend(
+        link,
+        f"G1 Z{TIP_PICKUP_Z + TOUCHDOWN_APPROACH_MM:.3f} F{Z_FEED}",
+        gcode_out=gcode_out,
+    )
+    gsend(link, f"G1 Z{TIP_PICKUP_Z:.3f} F{TIP_BOX_ENGAGE_FEED}", gcode_out=gcode_out)
+    # Lift: full Z_FEED — no damage risk on the way up
     gsend(link, f"G1 Z{TIP_BOX_CLEAR_Z:.3f} F{Z_FEED}", gcode_out=gcode_out)
     gsend(link, "M400", gcode_out=gcode_out)
 
@@ -282,10 +338,17 @@ def _aspirate(
     _phase_comment(gcode_out, "\n; --- aspirate @ reservoir (B3 SUCK) ---\n")
     # Intermediate Y to clear tip-box footprint at TIP_BOX_CLEAR_Z
     gsend(link, f"G1 Y{RESERVOIR_TRANSIT_Y:.3f} F{XY_FEED}", gcode_out=gcode_out)
-    # Diagonal descend + slide to aspirate position
+    # Diagonal descend + slide to aspirate position — touchdown split:
+    # fast Z+Y leg reaches the final Y while Z is still 10mm above the
+    # meniscus; slow pure-Z leg handles the last 10mm into the liquid.
     gsend(
         link,
-        f"G1 Z{RESERVOIR_DIVE_Z:.3f} Y{RESERVOIR_Y:.3f} F{Z_FEED}",
+        f"G1 Z{RESERVOIR_DIVE_Z + TOUCHDOWN_APPROACH_MM:.3f} Y{RESERVOIR_Y:.3f} F{Z_FEED}",
+        gcode_out=gcode_out,
+    )
+    gsend(
+        link,
+        f"G1 Z{RESERVOIR_DIVE_Z:.3f} F{LIQUID_DIVE_FEED}",
         gcode_out=gcode_out,
     )
     gsend(link, "M400", gcode_out=gcode_out)
@@ -314,7 +377,14 @@ def _dispense(
         f"G1 X{WELL_X:.3f} Y{y:.3f} F{XY_FEED}",
         gcode_out=gcode_out,
     )
-    gsend(link, f"G1 Z{WELL_DISPENSE_Z:.3f} F{Z_FEED}", gcode_out=gcode_out)
+    # Well dive — touchdown split: fast until 10mm above the meniscus,
+    # then slow (clean entry — avoids splashing / suction-side artefacts).
+    gsend(
+        link,
+        f"G1 Z{WELL_DISPENSE_Z + TOUCHDOWN_APPROACH_MM:.3f} F{Z_FEED}",
+        gcode_out=gcode_out,
+    )
+    gsend(link, f"G1 Z{WELL_DISPENSE_Z:.3f} F{LIQUID_DIVE_FEED}", gcode_out=gcode_out)
     gsend(link, "M400", gcode_out=gcode_out)
     op_dt = _fire_dpette(pipette, "dispense", WELL_DISPENSE_Z, gcode_out=gcode_out)
     # Lift to bar-clearance altitude (sets up the cross-deck transit to eject)
@@ -367,7 +437,17 @@ def _eject(
     )
     gsend(link, f"G1 X{RELEASE_BAR_X:.3f} F{XY_FEED}", gcode_out=gcode_out)
     gsend(link, "M400", gcode_out=gcode_out)
-    gsend(link, f"G1 Z{RELEASE_ENGAGE_Z:.3f} F{Z_FEED}", gcode_out=gcode_out)
+    # Hook engagement descent — touchdown split: fast until 10mm above
+    # the bar (Z=108), then slow (damage protection — avoid impact).
+    # Total descent is 17mm, so the fast leg is only 7mm — most of the
+    # dive is still slow, but the initial drop is no longer at F300.
+    gsend(
+        link,
+        f"G1 Z{RELEASE_ENGAGE_Z + TOUCHDOWN_APPROACH_MM:.3f} F{Z_FEED}",
+        gcode_out=gcode_out,
+    )
+    gsend(link, f"G1 Z{RELEASE_ENGAGE_Z:.3f} F{BAR_ENGAGE_FEED}", gcode_out=gcode_out)
+    # Lift: full Z_FEED — the lift IS the ejection action; speed is fine here
     gsend(link, f"G1 Z{RELEASE_CLEAR_Z:.3f} F{Z_FEED}", gcode_out=gcode_out)
     gsend(link, "M400", gcode_out=gcode_out)
 
@@ -377,12 +457,27 @@ def _cycle(
     pipette: DPetteDriver | None,
     cycle: int,
     num_cycles: int,
+    volume_ul: float,
+    prev_volume: float | None,
     *,
     gcode_out: TextIO | None = None,
 ) -> tuple[float, float]:
-    """One full pickup → aspirate → dispense → eject cycle. Returns (suck_s, blow_s)."""
-    print(f"\n[host] ====== CYCLE {cycle}/{num_cycles} ======")
-    _phase_comment(gcode_out, f"\n; ====== CYCLE {cycle}/{num_cycles} ======\n")
+    """One full pickup → aspirate → dispense → eject cycle.
+
+    Re-sends B2 PI_VOLUM only when `volume_ul != prev_volume`. Returns
+    (suck_s, blow_s).
+    """
+    print(
+        f"\n[host] ====== CYCLE {cycle}/{num_cycles} (volume={volume_ul:.1f} uL) ======"
+    )
+    _phase_comment(
+        gcode_out,
+        f"\n; ====== CYCLE {cycle}/{num_cycles} (volume={volume_ul:.1f} uL) ======\n",
+    )
+    if volume_ul != prev_volume:
+        if pipette is not None:
+            pipette.set_volume(volume_ul)  # B2 PI_VOLUM
+        _phase_comment(gcode_out, f"; >>> dpette.set_volume({volume_ul:.1f} uL)\n")
     _pickup(link, cycle, gcode_out=gcode_out)
     suck_s = _aspirate(link, pipette, gcode_out=gcode_out)
     blow_s = _dispense(link, pipette, cycle, gcode_out=gcode_out)
@@ -390,12 +485,19 @@ def _cycle(
     return suck_s, blow_s
 
 
-def _gcode_header(num_cycles: int, volume_ul: float) -> str:
+def _format_volumes(volumes_ul: tuple[float, ...]) -> str:
+    unique = set(volumes_ul)
+    if len(unique) == 1:
+        return f"{volumes_ul[0]:.1f} uL (constant; B2 PI_VOLUM set once)"
+    return f"per-cycle ({len(volumes_ul)} values: {list(volumes_ul)})"
+
+
+def _gcode_header(num_cycles: int, volume_desc: str) -> str:
     return (
         "; showcase_v0_full_pipettebot_rows.gcode\n"
         "; generated by examples/showcase_v0_full_pipettebot_rows.py\n"
         f"; row tour: {num_cycles} cycles × 8 channels = {num_cycles * 8} wells\n"
-        f"; per-channel volume: {volume_ul:.1f} uL (B2 PI_VOLUM set once)\n"
+        f"; per-channel volume: {volume_desc}\n"
         "; per-cycle: tip pickup → aspirate → dispense → mechanical eject\n"
         "; deck layout: docs/deck-layout.md\n"
         "; dPette ops logged inline as `; >>>` / `; <<<` comments\n"
@@ -405,19 +507,32 @@ def _gcode_header(num_cycles: int, volume_ul: float) -> str:
 def _run(
     link: serial.Serial | None,
     pipette: DPetteDriver | None,
-    num_cycles: int,
-    volume_ul: float,
+    volumes_ul: tuple[float, ...],
     gcode_out: TextIO | None,
 ) -> None:
+    num_cycles = len(volumes_ul)
+    volume_desc = _format_volumes(volumes_ul)
     _phase_comment(
         gcode_out,
-        _gcode_header(num_cycles, volume_ul)
-        + "; raise Z max feedrate + accel for snappy moves\n"
+        _gcode_header(num_cycles, volume_desc)
         + "; disable software endstops (Y axis positive 0-250; tip-box rows\n"
-        + "; can reach Y=255 at cycle 12 — verify clearance before N>10)\n",
+        + "; safety cap at MAX_NUM_CYCLES=8 — restore to 12 after bed re-layout)\n",
     )
-    gsend(link, "M203 Z20", gcode_out=gcode_out)
-    gsend(link, "M201 Z200", gcode_out=gcode_out)
+    profile = select_profile(os.environ.get("MOTION_PROFILE"))
+    if profile is None:
+        print("[host] motion profile: SKIPPED (MOTION_PROFILE opt-out)")
+        _phase_comment(
+            gcode_out, "; motion profile: SKIPPED (MOTION_PROFILE opt-out)\n"
+        )
+    else:
+        print(f"[host] motion profile: {profile.name}")
+        _phase_comment(
+            gcode_out,
+            f"; motion profile: {profile.name} "
+            "(via pipettebot.motion_profile.select_profile)\n",
+        )
+        for cmd in profile.as_marlin():
+            gsend(link, cmd, gcode_out=gcode_out)
     gsend(link, "M211 S0", gcode_out=gcode_out)
 
     _phase_comment(
@@ -430,31 +545,25 @@ def _run(
     gsend(link, f"G1 Z{POST_HOME_LIFT_Z:.3f} F{Z_FEED}", gcode_out=gcode_out)
     gsend(link, "M400", gcode_out=gcode_out)
 
-    if pipette is None:
-        _phase_comment(
-            gcode_out,
-            "\n; ===== phase 2: set per-channel volume (skipped — no PIPETTE_PORT) =====\n",
-        )
-    else:
-        _phase_comment(
-            gcode_out,
-            "\n; ===== phase 2: set per-channel volume (once) =====\n"
-            f"; >>> dpette.set_volume({volume_ul:.1f} uL)\n",
-        )
-        pipette.set_volume(volume_ul)  # B2 PI_VOLUM
-
+    total_ul = sum(volumes_ul) * 8
     _phase_comment(
         gcode_out,
-        f"\n; ===== phase 3: row tour ({num_cycles} cycles) =====\n"
-        f"; total dispensed: {volume_ul * num_cycles * 8:.0f} uL"
+        f"\n; ===== phase 2: row tour ({num_cycles} cycles) =====\n"
+        f"; per-channel volume: {volume_desc}\n"
+        f"; total dispensed: {total_ul:.0f} uL"
         f" across {num_cycles * 8} wells\n",
     )
     tour_start = time.perf_counter()
     suck_total = 0.0
     blow_total = 0.0
+    prev_volume: float | None = None
     for n in range(1, num_cycles + 1):
         cycle_start = time.perf_counter()
-        suck_s, blow_s = _cycle(link, pipette, n, num_cycles, gcode_out=gcode_out)
+        v = volumes_ul[n - 1]
+        suck_s, blow_s = _cycle(
+            link, pipette, n, num_cycles, v, prev_volume, gcode_out=gcode_out
+        )
+        prev_volume = v
         suck_total += suck_s
         blow_total += blow_s
         cycle_dt = time.perf_counter() - cycle_start
@@ -463,19 +572,19 @@ def _run(
     tour_dt = time.perf_counter() - tour_start
     dpette_total = suck_total + blow_total
     print(
-        f"\n[host] phase 3 done: {tour_dt:.1f} s total"
+        f"\n[host] phase 2 done: {tour_dt:.1f} s total"
         f" ({dpette_total:.1f} s dPette / {tour_dt - dpette_total:.1f} s gantry)"
     )
     _phase_comment(
         gcode_out,
-        f"; phase 3 total: {tour_dt:.1f} s "
+        f"; phase 2 total: {tour_dt:.1f} s "
         f"({dpette_total:.1f} s dPette / {tour_dt - dpette_total:.1f} s gantry)\n",
     )
 
     _phase_comment(
         gcode_out,
-        "\n; ===== phase 4: park towards home corner then G28 =====\n"
-        "; at end of last cycle head sits at (X=0, Y=220, Z=115).\n"
+        "\n; ===== phase 3: park towards home corner then G28 =====\n"
+        "; at end of last cycle head sits at (X=5, Y=220, Z=115).\n"
         "; max safe Z near home is the bar's bottom edge — clear X first,\n"
         "; then diagonal descent below bar towards the home corner,\n"
         "; then home.\n",
@@ -500,7 +609,12 @@ def _resolve_num_cycles() -> int:
         raise SystemExit(f"ERROR: NUM_CYCLES must be an integer, got {raw!r}") from None
     if not MIN_NUM_CYCLES <= n <= MAX_NUM_CYCLES:
         raise SystemExit(
-            f"ERROR: NUM_CYCLES must be in {MIN_NUM_CYCLES}..{MAX_NUM_CYCLES}, got {n}"
+            f"ERROR: NUM_CYCLES must be in {MIN_NUM_CYCLES}..{MAX_NUM_CYCLES}, got {n}.\n"
+            f"       Cap is temporarily {MAX_NUM_CYCLES} — the current\n"
+            f"       bed/plate part layout is not safety-compliant for N>{MAX_NUM_CYCLES}:\n"
+            f"       tip-box and well-plate footprints clash with fixtures on\n"
+            f"       the bed past that point. Restore to 12 only after the bed\n"
+            f"       layout is re-arranged and re-measured."
         )
     return n
 
@@ -515,6 +629,81 @@ def _describe_mode(have_gantry: bool, have_pipette: bool) -> str:
     return "DRY RUN — both serial skipped; G-code tee only"
 
 
+def _setup_so101_or_exit(config_path: str, arm_id: str):  # type: ignore[no-untyped-def]
+    """Load + connect + preflight the SO-101 controller. sys.exit(1) on missing key."""
+    from pipettebot.so101.orchestrator import (
+        DEMO_PICKUP_SEQUENCE,
+        load_so101_controller,
+        validate_sequence_positions,
+    )
+
+    print(f"[host] SO-101 orchestrator: config={config_path}, arm={arm_id}")
+    controller = load_so101_controller(config_path)
+    try:
+        validate_sequence_positions(controller.config, DEMO_PICKUP_SEQUENCE)
+    except KeyError as missing:
+        sys.stderr.write(
+            f"ERROR: SO101_CONFIG missing position {missing}.\n"
+            f"       Required: {list(DEMO_PICKUP_SEQUENCE)}\n"
+        )
+        controller.disconnect()
+        raise SystemExit(1) from missing
+    return controller
+
+
+def _run_so101_bin_pickup(controller, arm_id: str) -> None:  # type: ignore[no-untyped-def]
+    """Hand off to the SO-101 demo pickup-rotate sequence after the i3 homes."""
+    from pipettebot.so101.orchestrator import DEMO_PICKUP_SEQUENCE, run_sequence
+
+    print(f"[host] SO-101 bin pickup: {arm_id} <- demo_pickup_*")
+    run_sequence(controller, arm_id, DEMO_PICKUP_SEQUENCE)
+
+
+def _setup_marlin_or_exit(
+    port: str,
+    baud: int,
+    so101_controller,  # type: ignore[no-untyped-def]
+) -> serial.Serial | None:
+    """Open Marlin USB-serial. sys.exit(1) on failure, after disconnecting so101."""
+    if not port:
+        return None
+    link = open_marlin_port(port, baudrate=baud, timeout=2.0)
+    if link is None:
+        sys.stderr.write(
+            f"ERROR: could not open Marlin port {port} @ {baud}.\n"
+            "       Run `uv run tools/preflight.py` to verify.\n"
+        )
+        if so101_controller is not None:
+            so101_controller.disconnect()
+        raise SystemExit(1)
+    return link
+
+
+def _setup_pipette_or_exit(
+    pipette_port: str,
+    pipette_baud: int,
+    link: serial.Serial | None,
+    so101_controller,  # type: ignore[no-untyped-def]
+) -> DPetteDriver | None:
+    """Connect the dPette. sys.exit(1) on stub fall-back, after closing link + so101."""
+    if not pipette_port:
+        return None
+    print(f"[host] connecting dPette on {pipette_port} @ {pipette_baud}")
+    pipette = DPetteDriver(SerialConfig(port=pipette_port, baudrate=pipette_baud))
+    pipette.connect()  # A0 HELLO → B0 WOL (PI mode) → motor homes
+    if pipette.stub_mode:
+        sys.stderr.write(
+            f"ERROR: dPette on {pipette_port} fell back to stub mode.\n"
+            "       Wake it (press its button), replug, and retry.\n"
+        )
+        if link is not None:
+            link.close()
+        if so101_controller is not None:
+            so101_controller.disconnect()
+        raise SystemExit(1)
+    return pipette
+
+
 def main() -> int:
     if "--help" in sys.argv or "-h" in sys.argv:
         print(__doc__)
@@ -523,40 +712,39 @@ def main() -> int:
     pipette_port = os.environ.get("PIPETTE_PORT", "").strip()
     baud = int(os.environ.get("I3MEGA_BAUD", str(DEFAULT_BAUD)))
     pipette_baud = int(os.environ.get("PIPETTE_BAUD", str(DEFAULT_PIPETTE_BAUD)))
-    num_cycles = _resolve_num_cycles()
-    volume_ul = float(os.environ.get("PIPETTE_VOLUME_UL", str(DEFAULT_VOLUME_UL)))
+    so101_config_path = os.environ.get("SO101_CONFIG", "").strip()
+    so101_arm_id = os.environ.get("SO101_ARM_ID", "arm_a").strip() or "arm_a"
+    num_cycles_env = _resolve_num_cycles()
+    volumes_ul, banner = build_volumes(num_cycles_env, "cycles")
+    if len(volumes_ul) > num_cycles_env:
+        sys.stderr.write(
+            f"ERROR: PIPETTE_PROFILE has {len(volumes_ul)} cycles but NUM_CYCLES\n"
+            f"       is {num_cycles_env} (safety cap {MAX_NUM_CYCLES}). The profile\n"
+            f"       must not exceed the env-supplied cycle count — trim the\n"
+            f"       profile, raise NUM_CYCLES, or both.\n"
+        )
+        return 1
+    num_cycles = len(volumes_ul)
+    total_ul = sum(volumes_ul) * 8
     gcode_path = os.environ.get("OUTPUT_GCODE", DEFAULT_GCODE_OUT)
 
     print(f"[host] mode: {_describe_mode(bool(port), bool(pipette_port))}")
+    print(f"[host] {banner}")
     print(
         f"[host] row tour: {num_cycles} cycles "
-        f"× 8 channels × {volume_ul:.1f} uL = "
-        f"{num_cycles * 8 * volume_ul:.0f} uL total"
+        f"× 8 channels = {num_cycles * 8} wells, {total_ul:.0f} uL total"
     )
 
-    link: serial.Serial | None = None
-    if port:
-        link = open_marlin_port(port, baudrate=baud, timeout=2.0)
-        if link is None:
-            sys.stderr.write(
-                f"ERROR: could not open Marlin port {port} @ {baud}.\n"
-                "       Run `uv run tools/preflight.py` to verify.\n"
-            )
-            return 1
+    # SO-101 preflight runs BEFORE any i3/dPette motion so a missing
+    # named-position yaml key fails fast (not mid-run).
+    so101_controller = (
+        _setup_so101_or_exit(so101_config_path, so101_arm_id)
+        if so101_config_path
+        else None
+    )
 
-    pipette: DPetteDriver | None = None
-    if pipette_port:
-        print(f"[host] connecting dPette on {pipette_port} @ {pipette_baud}")
-        pipette = DPetteDriver(SerialConfig(port=pipette_port, baudrate=pipette_baud))
-        pipette.connect()  # A0 HELLO → B0 WOL (PI mode) → motor homes
-        if pipette.stub_mode:
-            sys.stderr.write(
-                f"ERROR: dPette on {pipette_port} fell back to stub mode.\n"
-                "       Wake it (press its button), replug, and retry.\n"
-            )
-            if link is not None:
-                link.close()
-            return 1
+    link = _setup_marlin_or_exit(port, baud, so101_controller)
+    pipette = _setup_pipette_or_exit(pipette_port, pipette_baud, link, so101_controller)
 
     try:
         if link is not None:
@@ -564,11 +752,15 @@ def main() -> int:
                 print(f"[host] open {port} @ {baud}; waiting 3s for Marlin boot")
                 time.sleep(3)
                 link.reset_input_buffer()
-                _execute(link, pipette, num_cycles, volume_ul, gcode_path)
+                _execute(link, pipette, volumes_ul, gcode_path)
         else:
-            _execute(None, pipette, num_cycles, volume_ul, gcode_path)
+            _execute(None, pipette, volumes_ul, gcode_path)
+        if so101_controller is not None:
+            _run_so101_bin_pickup(so101_controller, so101_arm_id)
         print("[host] done")
     finally:
+        if so101_controller is not None:
+            so101_controller.disconnect()
         if pipette is not None:
             pipette.disconnect()
     return 0
@@ -577,16 +769,15 @@ def main() -> int:
 def _execute(
     link: serial.Serial | None,
     pipette: DPetteDriver | None,
-    num_cycles: int,
-    volume_ul: float,
+    volumes_ul: tuple[float, ...],
     gcode_path: str,
 ) -> None:
     if gcode_path:
         print(f"[host] tee G-code stream to {gcode_path}")
         with open(gcode_path, "w") as gf:
-            _run(link, pipette, num_cycles, volume_ul, gf)
+            _run(link, pipette, volumes_ul, gf)
     else:
-        _run(link, pipette, num_cycles, volume_ul, None)
+        _run(link, pipette, volumes_ul, None)
 
 
 if __name__ == "__main__":
