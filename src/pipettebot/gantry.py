@@ -6,10 +6,15 @@ import array
 import fcntl
 import sys
 import termios
+import time
+import warnings
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import serial
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # Linux termios2 fallback: some Python builds don't expose `termios.B250000`
 # (depends on the headers CPython was compiled against, not the distro), so
@@ -30,13 +35,14 @@ def set_custom_baud_linux(fd: int, baudrate: int) -> None:
     fcntl.ioctl(fd, _TCSETS2, buf, True)
 
 
-def open_marlin_port(
+def open_gcode_port(
     port: str, baudrate: int = 250000, timeout: float = 2.0
 ) -> serial.Serial | None:
-    """Open `port` at `baudrate`, falling back to Linux termios2 when pyserial
-    can't set the rate (e.g. missing `termios.B250000`).
+    """Open `port` at `baudrate` with a Linux termios2 fallback.
 
-    Returns None if the port can't be opened at all (permission, ENOENT, etc.).
+    When pyserial can't set the rate (e.g. missing `termios.B250000`), retries
+    via the TCSETS2 + BOTHER ioctl. Returns None if the port can't be opened
+    at all (permission, ENOENT, etc.).
     """
     try:
         return serial.Serial(port, baudrate, timeout=timeout)
@@ -55,16 +61,84 @@ def open_marlin_port(
     return link
 
 
-class _SerialPort(Protocol):
-    """Subset of pyserial.Serial used by GcodeGantry; lets tests inject fakes."""
+def open_marlin_port(
+    port: str, baudrate: int = 250000, timeout: float = 2.0
+) -> serial.Serial | None:
+    """Deprecated alias for `open_gcode_port`.
 
-    def write(self, data: bytes) -> int: ...
+    The helper is firmware-agnostic (a Linux baud helper, not Marlin-specific);
+    the old name is preserved for one release cycle so operators with downstream
+    scripts can migrate without breakage.
+    """
+    warnings.warn(
+        "open_marlin_port() is deprecated; use open_gcode_port() instead "
+        "(the helper is firmware-agnostic, not Marlin-specific).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return open_gcode_port(port, baudrate=baudrate, timeout=timeout)
+
+
+class _SerialPort(Protocol):
+    """Subset of pyserial.Serial used by GcodeGantry; lets tests inject fakes.
+
+    `write` is typed to match `serial.Serial.write` (positional-only, returns
+    `int | None`) so the helper accepts real pyserial ports without Pyright
+    protocol-mismatch noise.
+    """
+
+    def write(self, data: bytes, /) -> int | None: ...
     def readline(self) -> bytes: ...
     def close(self) -> None: ...
 
 
+def send_and_wait_for_ok(
+    link: _SerialPort,
+    cmd: str,
+    *,
+    max_secs: float = 30.0,
+    on_line: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Send `cmd` to `link` and read lines until firmware acknowledges with `ok`.
+
+    Returns every non-empty reply line collected (the terminating `ok` line
+    included). If `on_line` is given, it's called with each line as it arrives
+    — useful for streaming display in interactive REPLs.
+
+    Args:
+        link: Serial-like object exposing `write(bytes)` and `readline()`.
+        cmd: Command to send. A trailing newline is appended.
+        max_secs: Maximum wall-clock seconds to wait for `ok` before raising.
+        on_line: Optional callback invoked per received line.
+
+    Returns:
+        The non-empty reply lines, in order, with the terminating `ok` line last.
+
+    Raises:
+        TimeoutError: if no `ok` arrives within `max_secs`.
+    """
+    link.write((cmd + "\n").encode("ascii"))
+    lines: list[str] = []
+    deadline = time.time() + max_secs
+    while time.time() < deadline:
+        raw = link.readline()
+        if not raw:
+            continue
+        s = raw.decode("ascii", errors="replace").rstrip()
+        if not s:
+            continue
+        lines.append(s)
+        if on_line is not None:
+            on_line(s)
+        if s == "ok" or s.startswith("ok "):
+            return lines
+    raise TimeoutError(f"no `ok` after {max_secs}s for `{cmd}`")
+
+
 @dataclass(frozen=True)
 class GantryConfig:
+    """Serial transport + default feedrate for a `GcodeGantry`."""
+
     port: str
     baudrate: int = 115200
     feedrate_mm_per_min: int = 3000
@@ -79,22 +153,63 @@ class GcodeGantry:
     """
 
     def __init__(self, cfg: GantryConfig, port: _SerialPort) -> None:
+        """Bind `cfg` to an already-open `port` (tests inject a fake)."""
         self._cfg = cfg
         self._port = port
 
-    def _send(self, line: str) -> str:
-        self._port.write((line + "\n").encode("ascii"))
-        return self._port.readline().decode("ascii", errors="replace").strip()
+    def send(self, line: str, *, max_secs: float = 30.0) -> str:
+        """Send a raw G-code `line`; return the firmware's terminating `ok` line.
+
+        Prefer the named methods (`home`, `move_to`, `wait_for_moves`) when one
+        fits. Use `send` for G-code outside the wrapped surface — e.g. single-
+        axis homes, `G92`, motion-profile setters from
+        `pipettebot.motion_profile.MotionProfile.as_marlin()`. Pass `max_secs`
+        higher than 30 s for commands the firmware may take a long time to
+        ack (e.g. a final `M400` draining a deep motion queue on Smartto).
+        """
+        return send_and_wait_for_ok(self._port, line, max_secs=max_secs)[-1]
+
+    def query(self, line: str, *, max_secs: float = 30.0) -> list[str]:
+        """Send `line`; return every non-empty reply (including the final `ok`).
+
+        Use for commands whose reply payload matters — `M119` (endstops),
+        `M114` (position), `M115` (identity), `M503` (settings dump). For
+        fire-and-forget commands where only the ack matters, use `send`.
+        """
+        return send_and_wait_for_ok(self._port, line, max_secs=max_secs)
+
+    def flush_input(self) -> None:
+        """Drop any received-but-unread bytes from the OS serial buffer.
+
+        Use after long bursts of multi-line-reply commands (`M119`, `M114`)
+        where pyserial's `select()` may falsely report data-ready against an
+        empty OS buffer, throwing `SerialException` on the next read.
+        """
+        # `_SerialPort` doesn't formally declare this — both pyserial.Serial
+        # and tests/conftest.py::FakeSerial expose it; we call it lazily so
+        # ports without the method (none in this codebase) would error
+        # loudly at runtime rather than silently no-op.
+        self._port.reset_input_buffer()  # type: ignore[attr-defined]
 
     def home(self) -> str:
-        return self._send("G28")
+        """Home all axes via `G28`. Returns the firmware reply line."""
+        return self.send("G28")
 
     def move_to(self, x: float, y: float, z: float, feedrate: int | None = None) -> str:
+        """Move to `(x, y, z)` at `feedrate` mm/min (or the config default)."""
         f = feedrate if feedrate is not None else self._cfg.feedrate_mm_per_min
-        return self._send(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{f}")
+        return self.send(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{f}")
 
-    def wait_for_moves(self) -> str:
-        return self._send("M400")
+    def wait_for_moves(self, *, max_secs: float = 30.0) -> str:
+        """Block until the planner queue drains (`M400`).
+
+        Pass `max_secs` higher than the default 30 s when draining a deep
+        queue — e.g. on Smartto after a cycle loop where per-move `M400`
+        acks may have returned before motion physically completed, leaving
+        accumulated work for a final drain to process.
+        """
+        return self.send("M400", max_secs=max_secs)
 
     def close(self) -> None:
+        """Close the underlying serial port."""
         self._port.close()
