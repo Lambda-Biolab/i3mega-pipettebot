@@ -31,19 +31,19 @@ Single source of truth for agents working in this repo. `CLAUDE.md` and
 
 | Question                                        | Answer for v0                                                    |
 |-------------------------------------------------|------------------------------------------------------------------|
-| Where does new code go?                         | `src/pipettebot/`. Six modules: `gantry`, `bot`, `experiment_profile`, `motion_profile`, `cli_profile`, `__init__`. |
+| Where does new code go?                         | `src/pipettebot/`. Seven modules: `gantry`, `bot`, `devices`, `experiment_profile`, `motion_profile`, `cli_profile`, `__init__`. |
 | Where do experiment profiles live?              | `examples/experiment_profiles/*.toml`; loader in `src/pipettebot/experiment_profile.py`. See issue #79. |
 | Where do motion profiles live?                  | Bundled Python constants in `src/pipettebot/motion_profile.py` (slow/mid/fast). `MOTION_PROFILE` env selects; default `mid`; `''` or `off` opts out. See [ADR 0003](docs/adr/0003-motion-profile-bundled-constants.md). |
 | Where does deck geometry live?                  | Deferred. Caller passes raw `(x, y, z)` in v0.                   |
 | How is dpette imported?                         | Git dep, pinned to a commit SHA before v0.0.1 tag.               |
-| Where do hardware experiments go?               | `tools/` — diagnostics (`preflight.py`, `diagnose_axis.py`, `marlin_repl.py`), CAD (`tools/cad/`), slicer (`tools/slicer/`). Logs to `captures/`. |
+| Where do hardware experiments go?               | `tools/` — diagnostics (`preflight.py`, `diagnose_axis.py`, `gantry_repl.py`, `gantry_probe.py`), CAD (`tools/cad/`), slicer (`tools/slicer/`). Logs to `captures/`. `gantry_repl` and `gantry_probe` auto-detect firmware via `pipettebot.devices.discover`; replace the older `marlin_repl` / `smartto_repl` / `smartto_probe` trio. |
 | Where does SO-101 orchestration live?           | `src/pipettebot/so101/` — `orchestrator.py` (named-position playback after the i3 homes) + `capture_position.py` (teaching CLI). Composition over `so101.DualArmController`; opt-in via `SO101_CONFIG` env. Optional `[orchestrator]` extra; sequence constant hardcoded for v0. See issue #120 and the `_ArmController` Protocol refactor in #133. |
 | What goes in AGENT_REQUESTS.md?                 | Anything deferred — features, ADRs, hardware photos, firmware tracks. |
 
 ## Architecture Overview
 
 ```text
-examples/showcase_v0_pipette_sim.py
+examples/showcase_v0_i3_pipette_sim.py
         │
         ▼
 raw pyserial @ 250000 baud   ──► /dev/cu.usbserial-*  Marlin (Anycubic stock / AI3M)
@@ -52,15 +52,19 @@ raw pyserial @ 250000 baud   ──► /dev/cu.usbserial-*  Marlin (Anycubic sto
 
 src/pipettebot/                        (library, used by examples & tests)
     ├── PipetteBot                    ──► aspirate_at(x,y,z,vol), dispense_at(x,y,z), home()
-    ├── GcodeGantry                   ──► home(), move_to(x,y,z), wait_for_moves()
-    │                                     (note: GcodeGantry._send is one-line-per-ack;
-    │                                      the showcase example uses raw serial to
-    │                                      sidestep that until the lib is fixed)
+    ├── GcodeGantry                   ──► home(), move_to(x,y,z), wait_for_moves(),
+    │                                     send(line, max_secs), query(line) -> list[str],
+    │                                     flush_input()  (multi-line replies + stale-buffer reset)
+    ├── devices                       ──► discover(port) -> DiscoveredDevice (M115 + family),
+    │                                     FirmwarePolicy + policy_for(device),
+    │                                     resolve_port(env) (PRINTER_PORT),
+    │                                     safe_home(gantry, policy) -> Marlin G28 or
+    │                                     Smartto polled-Z descent (ADR 0004)
     ├── ExperimentProfile             ──► load_experiment_profile(path) → typed dataclass with
     │                                     per-cycle volumes + optional gradient note
     ├── MotionProfile                 ──► select_profile(MOTION_PROFILE) → SLOW/MID/FAST
-    │                                     bundled accel/jerk factor; as_marlin() emits the four
-    │                                     bootstrap M-codes (M203/M201/M204/M205)
+    │                                     bundled accel/jerk factor at 3x ratio; as_marlin()
+    │                                     emits the four bootstrap M-codes (M203/M201/M204/M205)
     └── cli_profile                   ──► build_volumes(default_count, unit_label) → shared
                                           env-var resolution for all showcases; routes
                                           PIPETTE_PROFILE / PIPETTE_VOLUME_UL to (volumes, banner)

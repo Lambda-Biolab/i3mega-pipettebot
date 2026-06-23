@@ -31,12 +31,13 @@ is missing. No pre-commit hooks; CI runs the same recipes.
 
 - Branch from `main`. Branch protection rejects merge commits — use **squash merges** only.
 - Topical commits: one logical change per commit, descriptive message.
-- Open a PR; ensure CI is green; squash-merge.
+- **Sign your commits.** Every commit on a PR branch must carry a verified GPG or SSH signature — see [GitHub's signed-commits docs](https://docs.github.com/en/authentication/managing-commit-signature-verification) for setup. Unsigned commits will be asked to amend and re-push before merge; branch protection enforces this at the source-branch level.
+- Open a PR; ensure CI is green; squash-merge. Squash-merge preserves the author attribution on `main` (your name stays on the commit) — signing is about chain-of-custody for the source commits, not credit.
 
 ## Code conventions
 
 - Python ≥3.11, mypy strict, ruff (rule sets in `pyproject.toml`).
-- `src/pipettebot/` for library code. Six v0 modules (`gantry`, `bot`, `experiment_profile`, `motion_profile`, `cli_profile`, `__init__`) — see AGENTS.md.
+- `src/pipettebot/` for library code. Seven v0 modules (`gantry`, `bot`, `devices`, `experiment_profile`, `motion_profile`, `cli_profile`, `__init__`) — see AGENTS.md.
 - Tests use mocked serial fixtures from `tests/conftest.py`. New features need new tests.
 
 ## Hardware experiments
