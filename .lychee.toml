@@ -1,17 +1,18 @@
 # Lychee link checker config
-# 403 accepted: anti-bot blocking on vendor / forum sites (links work
-# for humans). 429 already accepted for rate-limiting backoff.
-accept = [200, 201, 202, 204, 403, 429]
+# https://lychee.cli.rs/usage/config/
+
+accept = [200, 201, 204, 429]
 timeout = 30
 max_retries = 2
 
 exclude = [
     "^https://img\\.shields\\.io",
-    "^https://github\\.com/qte77/",
-    # qte77/cadkit not yet public (planned extraction per ADR 0002).
-    "^https://github\\.com/qte77/cadkit",
-    "^https://www\\.anycubic\\.com",
-    # dlabsci dPette product page returns intermittent 522 (Cloudflare
-    # timeout); link works in practice.
-    "^https://www\\.dlabsci\\.com",
+    "^https://github\\.com/codespaces/new",
+    "^https://vscode\\.dev",
+    "^https://doi\\.org",
+    "^https://www\\.biorxiv\\.org",
+    "^https://huggingface\\.co",
+    "^https://en\\.wikipedia\\.org",
+    "^https://hub\\.docker\\.com",
+    "^https://pypi\\.org",
 ]
