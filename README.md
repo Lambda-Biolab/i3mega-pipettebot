@@ -33,7 +33,6 @@ The library is also pipette-agnostic via the `_Pipette` Protocol.
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![CI / pytest](https://github.com/qte77/i3mega-pipettebot/actions/workflows/ci.yml/badge.svg)](https://github.com/qte77/i3mega-pipettebot/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/qte77/i3mega-pipettebot/actions/workflows/codeql.yml/badge.svg)](https://github.com/qte77/i3mega-pipettebot/actions/workflows/codeql.yml)
-[![CodeFactor](https://www.codefactor.io/repository/github/qte77/i3mega-pipettebot/badge)](https://www.codefactor.io/repository/github/qte77/i3mega-pipettebot)
 [![Dependabot](https://github.com/qte77/i3mega-pipettebot/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/qte77/i3mega-pipettebot/actions/workflows/dependabot/dependabot-updates)
 
 ## Why this matters
